@@ -1,0 +1,29 @@
+version: v5.0
+
+participants:
+
+  - name: SourceDomain
+    kind: local
+    domain: 0
+    transport: udp
+
+  - name: CmsDomain
+    kind: local
+    domain: 1
+    transport: udp
+    whitelist-interfaces:
+      - "192.168.50.1"
+
+allowlist:
+  - name: CmsRttRequest
+    type: cms::CmsMessage
+  - name: CmsRttEcho1
+    type: cms::CmsMessage
+  - name: CmsRttEcho2
+    type: cms::CmsMessage
+  - name: CmsRttEcho3
+    type: cms::CmsMessage
+  - name: CmsRttEcho4
+    type: cms::CmsMessage
+  - name: CmsRttEcho5
+    type: cms::CmsMessage

@@ -1,0 +1,744 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <numeric>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "CmsMessage.hpp"
+#include "CmsMessagePubSubTypes.hpp"
+
+#include <fastdds/dds/domain/DomainParticipant.hpp>
+#include <fastdds/dds/domain/DomainParticipantFactory.hpp>
+#include <fastdds/dds/publisher/DataWriter.hpp>
+#include <fastdds/dds/publisher/DataWriterListener.hpp>
+#include <fastdds/dds/publisher/Publisher.hpp>
+#include <fastdds/dds/subscriber/DataReader.hpp>
+#include <fastdds/dds/subscriber/DataReaderListener.hpp>
+#include <fastdds/dds/subscriber/SampleInfo.hpp>
+#include <fastdds/dds/subscriber/Subscriber.hpp>
+#include <fastdds/dds/topic/Topic.hpp>
+#include <fastdds/dds/topic/TypeSupport.hpp>
+
+using namespace eprosima::fastdds::dds;
+
+struct Options
+{
+    uint32_t domain_id = 1;
+    std::string request_topic = "CmsRttRequest";
+    std::string echo_topic = "CmsRttEcho";
+
+    uint32_t node_id = 1;
+    uint32_t flow_id = 1;
+
+    uint32_t count = 100;
+    uint32_t payload_bytes = 256;
+    uint32_t period_ms = 16;
+
+    // Đây là ngưỡng RTT, không phải one-way latency.
+    uint32_t deadline_ms = 8;
+
+    uint32_t response_timeout_ms = 10000;
+
+    std::string qos_file = "./config/qos_baseline.xml";
+    std::string csv_file = "./wifi_rtt.csv";
+};
+
+struct RttRecord
+{
+    uint64_t sequence = 0;
+    double rtt_ms = 0.0;
+    bool deadline_miss = false;
+};
+
+static uint64_t steady_now_ns()
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+static void usage(const char* prog)
+{
+    std::cout
+        << "Usage:\n  " << prog
+        << " [--domain-id N]"
+        << " [--request-topic NAME]"
+        << " [--echo-topic NAME]"
+        << " [--node-id N]"
+        << " [--flow-id N]"
+        << " [--count N]"
+        << " [--payload-bytes N]"
+        << " [--period-ms N]"
+        << " [--deadline-ms N]"
+        << " [--response-timeout-ms N]"
+        << " [--qos FILE]"
+        << " [--csv FILE]\n";
+}
+
+static bool parse_args(int argc, char** argv, Options& o)
+{
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string a = argv[i];
+
+        if (a == "--domain-id" && i + 1 < argc)
+        {
+            o.domain_id = std::stoul(argv[++i]);
+        }
+        else if (a == "--request-topic" && i + 1 < argc)
+        {
+            o.request_topic = argv[++i];
+        }
+        else if (a == "--echo-topic" && i + 1 < argc)
+        {
+            o.echo_topic = argv[++i];
+        }
+        else if (a == "--node-id" && i + 1 < argc)
+        {
+            o.node_id = std::stoul(argv[++i]);
+        }
+        else if (a == "--flow-id" && i + 1 < argc)
+        {
+            o.flow_id = std::stoul(argv[++i]);
+        }
+        else if (a == "--count" && i + 1 < argc)
+        {
+            o.count = std::stoul(argv[++i]);
+        }
+        else if (a == "--payload-bytes" && i + 1 < argc)
+        {
+            o.payload_bytes = std::stoul(argv[++i]);
+        }
+        else if (a == "--period-ms" && i + 1 < argc)
+        {
+            o.period_ms = std::stoul(argv[++i]);
+        }
+        else if (a == "--deadline-ms" && i + 1 < argc)
+        {
+            o.deadline_ms = std::stoul(argv[++i]);
+        }
+        else if (a == "--response-timeout-ms" && i + 1 < argc)
+        {
+            o.response_timeout_ms = std::stoul(argv[++i]);
+        }
+        else if (a == "--qos" && i + 1 < argc)
+        {
+            o.qos_file = argv[++i];
+        }
+        else if (a == "--csv" && i + 1 < argc)
+        {
+            o.csv_file = argv[++i];
+        }
+        else if (a == "--help")
+        {
+            usage(argv[0]);
+            return false;
+        }
+        else
+        {
+            std::cerr << "Unknown/incomplete argument: " << a << '\n';
+            usage(argv[0]);
+            return false;
+        }
+    }
+
+    if (o.payload_bytes > 4096)
+    {
+        std::cerr << "payload-bytes must be <= 4096\n";
+        return false;
+    }
+
+    return true;
+}
+
+static double percentile(
+        std::vector<double> values,
+        double p)
+{
+    if (values.empty())
+    {
+        return 0.0;
+    }
+
+    std::sort(values.begin(), values.end());
+
+    const std::size_t index =
+        static_cast<std::size_t>(
+            std::ceil(p * static_cast<double>(values.size()))) - 1;
+
+    return values[
+        std::min(index, values.size() - 1)];
+}
+
+class RttClient
+{
+public:
+
+    explicit RttClient(const Options& options)
+        : options_(options)
+        , type_(new cms::CmsMessagePubSubType())
+    {
+    }
+
+    ~RttClient()
+    {
+        if (participant_ != nullptr)
+        {
+            participant_->delete_contained_entities();
+
+            DomainParticipantFactory::get_instance()
+                ->delete_participant(participant_);
+        }
+    }
+
+    bool init()
+    {
+        if (DomainParticipantFactory::get_instance()
+                ->load_XML_profiles_file(options_.qos_file) != RETCODE_OK)
+        {
+            std::cerr
+                << "Failed to load QoS XML: "
+                << options_.qos_file << '\n';
+            return false;
+        }
+
+        std::cout
+            << "Loaded QoS XML: "
+            << options_.qos_file << '\n';
+
+        participant_ =
+            DomainParticipantFactory::get_instance()
+                ->create_participant(
+                    options_.domain_id,
+                    PARTICIPANT_QOS_DEFAULT);
+
+        if (participant_ == nullptr)
+        {
+            std::cerr << "Failed to create participant.\n";
+            return false;
+        }
+
+        if (type_.register_type(participant_) != RETCODE_OK)
+        {
+            std::cerr << "Failed to register CmsMessage.\n";
+            return false;
+        }
+
+        request_topic_ =
+            participant_->create_topic(
+                options_.request_topic,
+                type_.get_type_name(),
+                TOPIC_QOS_DEFAULT);
+
+        echo_topic_ =
+            participant_->create_topic(
+                options_.echo_topic,
+                type_.get_type_name(),
+                TOPIC_QOS_DEFAULT);
+
+        if (request_topic_ == nullptr || echo_topic_ == nullptr)
+        {
+            std::cerr << "Failed to create RTT topics.\n";
+            return false;
+        }
+
+        publisher_ =
+            participant_->create_publisher(
+                PUBLISHER_QOS_DEFAULT);
+
+        subscriber_ =
+            participant_->create_subscriber(
+                SUBSCRIBER_QOS_DEFAULT);
+
+        if (publisher_ == nullptr || subscriber_ == nullptr)
+        {
+            std::cerr
+                << "Failed to create publisher/subscriber.\n";
+            return false;
+        }
+
+        writer_ =
+            publisher_->create_datawriter_with_profile(
+                request_topic_,
+                "cms_writer_profile",
+                &writer_listener_);
+
+        if (writer_ == nullptr)
+        {
+            std::cerr << "Failed to create request writer.\n";
+            return false;
+        }
+
+        reader_listener_.owner = this;
+
+        reader_ =
+            subscriber_->create_datareader_with_profile(
+                echo_topic_,
+                "cms_reader_profile",
+                &reader_listener_);
+
+        if (reader_ == nullptr)
+        {
+            std::cerr << "Failed to create echo reader.\n";
+            return false;
+        }
+
+        std::cout
+            << "DDS RTT client initialized.\n"
+            << "Domain         : " << options_.domain_id << '\n'
+            << "Request topic  : " << options_.request_topic << '\n'
+            << "Echo topic     : " << options_.echo_topic << '\n'
+            << "Count          : " << options_.count << '\n'
+            << "Payload        : " << options_.payload_bytes << " B\n"
+            << "Period         : " << options_.period_ms << " ms\n"
+            << "RTT deadline   : " << options_.deadline_ms << " ms\n";
+
+        return true;
+    }
+
+    bool wait_for_matches()
+    {
+        std::cout
+            << "Waiting for echo responder matching...\n";
+
+        const auto deadline =
+            std::chrono::steady_clock::now()
+            + std::chrono::seconds(10);
+
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            if (writer_listener_.matched_readers.load() > 0 &&
+                    reader_listener_.matched_writers.load() > 0)
+            {
+                std::cout << "RTT endpoints matched.\n";
+                return true;
+            }
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(100));
+        }
+
+        std::cerr
+            << "Timeout waiting for RTT endpoint matching.\n";
+
+        return false;
+    }
+
+    void run()
+    {
+        cms::CmsMessage message;
+
+        message.node_id(options_.node_id);
+        message.flow_id(options_.flow_id);
+
+        std::vector<uint8_t> payload(
+            options_.payload_bytes,
+            static_cast<uint8_t>(options_.node_id & 0xff));
+
+        message.payload(payload);
+
+        const auto start =
+            std::chrono::steady_clock::now();
+
+        for (uint64_t seq = 0;
+                seq < options_.count;
+                ++seq)
+        {
+            const auto target =
+                start
+                + std::chrono::milliseconds(
+                    options_.period_ms * seq);
+
+            std::this_thread::sleep_until(target);
+
+            message.sequence_number(seq);
+
+            const uint64_t send_ns =
+                steady_now_ns();
+
+            message.send_timestamp_ns(send_ns);
+
+            const auto write_begin =
+                std::chrono::steady_clock::now();
+
+            const auto write_rc =
+                writer_->write(&message);
+
+            const auto write_end =
+                std::chrono::steady_clock::now();
+
+            const double write_ms =
+                std::chrono::duration<double, std::milli>(
+                    write_end - write_begin).count();
+
+            if (write_ms > 5.0)
+            {
+                std::cerr
+                    << "WRITE_LATENCY"
+                    << " node=" << options_.node_id
+                    << " seq=" << seq
+                    << " write_ms=" << write_ms
+                    << '\n';
+            }
+
+            if (write_rc != RETCODE_OK)
+            {
+                std::cerr
+                    << "Failed to send seq="
+                    << seq << '\n';
+            }
+            else if (seq % 100 == 0 || seq + 1 == options_.count)
+            {
+                std::cout
+                    << "SEND"
+                    << " node=" << options_.node_id
+                    << " flow=" << options_.flow_id
+                    << " seq=" << seq
+                    << " payload=" << options_.payload_bytes
+                    << " B\n";
+            }
+        }
+
+        std::cout << "Waiting for all request acknowledgments...\n";
+
+        const auto ack_ret =
+            writer_->wait_for_acknowledgments(
+                Duration_t(5, 0));
+
+        if (ack_ret != RETCODE_OK)
+        {
+            std::cerr
+                << "WARNING: request acknowledgments incomplete "
+                << "before timeout.\n";
+        }
+        else
+        {
+            std::cout
+                << "All requests acknowledged by responder.\n";
+        }
+
+        std::unique_lock<std::mutex> lock(records_mutex_);
+
+        records_cv_.wait_for(
+            lock,
+            std::chrono::milliseconds(
+                options_.response_timeout_ms),
+            [this]()
+            {
+                return received_.load() >= options_.count;
+            });
+
+        lock.unlock();
+
+        print_summary();
+        write_csv();
+    }
+
+private:
+
+    class WriterListener : public DataWriterListener
+    {
+    public:
+
+        std::atomic<int> matched_readers{0};
+
+        void on_publication_matched(
+                DataWriter*,
+                const PublicationMatchedStatus& status) override
+        {
+            matched_readers.store(status.current_count);
+
+            std::cout
+                << "[DDS] Request writer matched. current readers = "
+                << status.current_count << '\n';
+        }
+    };
+
+    class ReaderListener : public DataReaderListener
+    {
+    public:
+
+        RttClient* owner = nullptr;
+        std::atomic<int> matched_writers{0};
+
+        void on_subscription_matched(
+                DataReader*,
+                const SubscriptionMatchedStatus& status) override
+        {
+            matched_writers.store(status.current_count);
+
+            std::cout
+                << "[DDS] Echo reader matched. current writers = "
+                << status.current_count << '\n';
+        }
+
+        void on_data_available(DataReader* reader) override
+        {
+            if (owner == nullptr)
+            {
+                return;
+            }
+
+            cms::CmsMessage message;
+            SampleInfo info;
+
+            while (reader->take_next_sample(
+                    &message,
+                    &info) == RETCODE_OK)
+            {
+                if (!info.valid_data)
+                {
+                    continue;
+                }
+
+                // Each RTT client must only process echoes that belong
+                // to its own source flow.
+                if (message.node_id() != owner->options_.node_id ||
+                        message.flow_id() != owner->options_.flow_id)
+                {
+                    continue;
+                }
+
+                const uint64_t now_ns =
+                    steady_now_ns();
+
+                const uint64_t send_ns =
+                    message.send_timestamp_ns();
+
+                if (send_ns == 0 || now_ns < send_ns)
+                {
+                    continue;
+                }
+
+                const double rtt_ms =
+                    static_cast<double>(
+                        now_ns - send_ns) / 1e6;
+
+                RttRecord record;
+                record.sequence =
+                    message.sequence_number();
+                record.rtt_ms = rtt_ms;
+                record.deadline_miss =
+                    rtt_ms >
+                    static_cast<double>(
+                        owner->options_.deadline_ms);
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        owner->records_mutex_);
+
+                    owner->records_.push_back(record);
+                }
+
+                owner->received_.fetch_add(1);
+
+                if (record.sequence % 100 == 0 ||
+                        record.sequence + 1 == owner->options_.count)
+                {
+                    std::cout
+                        << std::fixed
+                        << std::setprecision(3)
+                        << "ECHO_RECV"
+                        << " seq=" << record.sequence
+                        << " rtt=" << record.rtt_ms
+                        << " ms"
+                        << " deadline_miss="
+                        << (record.deadline_miss ? "YES" : "NO")
+                        << '\n';
+                }
+
+                owner->records_cv_.notify_all();
+            }
+        }
+    };
+
+    void print_summary()
+    {
+        std::vector<RttRecord> records;
+
+        {
+            std::lock_guard<std::mutex> lock(records_mutex_);
+            records = records_;
+        }
+
+        std::sort(
+            records.begin(),
+            records.end(),
+            [](const RttRecord& a, const RttRecord& b)
+            {
+                return a.sequence < b.sequence;
+            });
+
+        std::vector<double> rtts;
+        rtts.reserve(records.size());
+
+        uint32_t misses = 0;
+
+        for (const auto& r : records)
+        {
+            rtts.push_back(r.rtt_ms);
+
+            if (r.deadline_miss)
+            {
+                ++misses;
+            }
+        }
+
+        std::cout
+            << "\n===== RTT SUMMARY =====\n"
+            << "sent          = " << options_.count << '\n'
+            << "echo received = " << records.size() << '\n'
+            << "missing echo  = "
+            << (options_.count - records.size()) << '\n';
+
+        if (rtts.empty())
+        {
+            std::cout << "No valid RTT samples.\n";
+            return;
+        }
+
+        const double min_rtt =
+            *std::min_element(
+                rtts.begin(),
+                rtts.end());
+
+        const double max_rtt =
+            *std::max_element(
+                rtts.begin(),
+                rtts.end());
+
+        const double mean =
+            std::accumulate(
+                rtts.begin(),
+                rtts.end(),
+                0.0) /
+            static_cast<double>(rtts.size());
+
+        std::cout
+            << std::fixed
+            << std::setprecision(3)
+            << "min           = " << min_rtt << " ms\n"
+            << "mean          = " << mean << " ms\n"
+            << "p95           = "
+            << percentile(rtts, 0.95) << " ms\n"
+            << "p99           = "
+            << percentile(rtts, 0.99) << " ms\n"
+            << "max           = " << max_rtt << " ms\n"
+            << "RTT deadline  = "
+            << options_.deadline_ms << " ms\n"
+            << "deadline miss = "
+            << misses << " / " << rtts.size()
+            << " ("
+            << (100.0 * misses /
+                static_cast<double>(rtts.size()))
+            << "%)\n";
+    }
+
+    void write_csv()
+    {
+        std::vector<RttRecord> records;
+
+        {
+            std::lock_guard<std::mutex> lock(records_mutex_);
+            records = records_;
+        }
+
+        std::sort(
+            records.begin(),
+            records.end(),
+            [](const RttRecord& a, const RttRecord& b)
+            {
+                return a.sequence < b.sequence;
+            });
+
+        std::ofstream out(options_.csv_file);
+
+        if (!out)
+        {
+            std::cerr
+                << "Failed to open CSV: "
+                << options_.csv_file << '\n';
+            return;
+        }
+
+        out
+            << "sequence_number,"
+            << "rtt_ms,"
+            << "deadline_miss\n";
+
+        out << std::fixed << std::setprecision(6);
+
+        for (const auto& r : records)
+        {
+            out
+                << r.sequence << ','
+                << r.rtt_ms << ','
+                << (r.deadline_miss ? 1 : 0)
+                << '\n';
+        }
+
+        std::cout
+            << "CSV           = "
+            << options_.csv_file << '\n';
+    }
+
+    Options options_;
+
+    TypeSupport type_;
+
+    DomainParticipant* participant_ = nullptr;
+
+    Topic* request_topic_ = nullptr;
+    Topic* echo_topic_ = nullptr;
+
+    Publisher* publisher_ = nullptr;
+    Subscriber* subscriber_ = nullptr;
+
+    DataWriter* writer_ = nullptr;
+    DataReader* reader_ = nullptr;
+
+    WriterListener writer_listener_;
+    ReaderListener reader_listener_;
+
+    std::atomic<uint32_t> received_{0};
+
+    std::mutex records_mutex_;
+    std::condition_variable records_cv_;
+    std::vector<RttRecord> records_;
+};
+
+int main(int argc, char** argv)
+{
+    Options options;
+
+    if (!parse_args(argc, argv, options))
+    {
+        return 1;
+    }
+
+    RttClient client(options);
+
+    if (!client.init())
+    {
+        return 1;
+    }
+
+    if (!client.wait_for_matches())
+    {
+        return 1;
+    }
+
+    client.run();
+
+    return 0;
+}

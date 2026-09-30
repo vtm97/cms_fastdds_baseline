@@ -1,0 +1,1937 @@
+#!/usr/bin/env python3
+
+import argparse
+import csv
+import os
+import subprocess
+import sys
+from collections import Counter
+
+
+# ============================================================
+# RTPS entity IDs used by DDS discovery
+# ============================================================
+
+SPDP_WRITER = "0x000100c2"
+
+SEDP_PUBLICATIONS_WRITER = "0x000003c2"
+SEDP_SUBSCRIPTIONS_WRITER = "0x000004c2"
+
+RTPS_DATA = "0x15"
+RTPS_HEARTBEAT = "0x07"
+RTPS_ACKNACK = "0x06"
+RTPS_DATA_FRAG = "0x16"
+
+
+# RTPS DATA submessage content before SerializedPayload:
+#
+# extraFlags          2 B
+# octetsToInlineQos   2 B
+# readerEntityId      4 B
+# writerEntityId      4 B
+# writerSN            8 B
+# ------------------------
+# total              20 B
+#
+# This analyzer currently assumes DATA without inline QoS,
+# which matches the Fast DDS baseline used in this experiment.
+
+DATA_FIXED_BYTES_BEFORE_PAYLOAD = 20
+
+
+# ============================================================
+# tshark helpers
+# ============================================================
+
+def run_tshark(
+        pcap,
+        display_filter, 
+        fields,
+        occurrence="a"):
+    cmd = [
+        "tshark",
+        "-r", pcap,
+        "-Y", display_filter,
+        "-T", "fields",
+        "-E", "separator=;",
+        "-E", f"occurrence={occurrence}",
+        "-E", "aggregator=,"
+    ]
+
+    for field in fields:
+        cmd += ["-e", field]
+
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            text=True,
+            capture_output=True,
+            env=env
+        )
+    except FileNotFoundError:
+        print("ERROR: tshark was not found.", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        print("ERROR running tshark:", file=sys.stderr)
+        print(exc.stderr, file=sys.stderr)
+        sys.exit(1)
+
+    rows = []
+
+    for line in result.stdout.splitlines():
+        if line.strip():
+            rows.append(line.split(";"))
+
+    return rows
+
+
+def frame_map(pcap, display_filter):
+    rows = run_tshark(
+        pcap,
+        display_filter,
+        [
+            "frame.number",
+            "frame.time_relative",
+            "frame.len",
+            "ip.src",
+            "ip.dst"
+        ]
+    )
+
+    frames = {}
+
+    for row in rows:
+        if len(row) < 3:
+            continue
+
+        try:
+            frame_number = int(row[0])
+            frame_time = float(row[1])
+            frame_len = int(row[2])
+        except ValueError:
+            continue
+
+        frames[frame_number] = {
+            "time": frame_time,
+            "len": frame_len,
+            "src": row[3] if len(row) > 3 else "",
+            "dst": row[4] if len(row) > 4 else ""
+        }
+
+    return frames
+
+
+def split_multi(value):
+    if not value:
+        return []
+
+    return [
+        item.strip()
+        for item in value.split(",")
+        if item.strip()
+    ]
+
+def data_sequence_stats(
+        pcap,
+        display_filter):
+    """
+    Count application DATA occurrences and unique samples.
+
+    For the Fast DDS baseline captures used here,
+    the first rtps.sm.seqNumber occurrence in a frame
+    containing application DATA is the DATA writer
+    sequence number. Later occurrences may belong to
+    HEARTBEAT firstSN/lastSN fields.
+    """
+
+    rows = run_tshark(
+        pcap,
+        display_filter,
+        [
+            "ip.src",
+            "rtps.guidPrefix.src",
+            "rtps.sm.wrEntityId",
+            "rtps.sm.seqNumber"
+        ],
+        occurrence="f"
+    )
+
+    occurrences = 0
+    unique_samples = set()
+
+    for row in rows:
+        if len(row) < 4:
+            continue
+
+        src = row[0].strip()
+        guid_prefix = row[1].strip()
+        writer_entity = row[2].strip()
+        sequence = row[3].strip()
+
+        if not src or not writer_entity or not sequence:
+            continue
+
+        # GUID prefix distinguishes different DDS participants
+        # even when several writers share the same host/IP.
+        writer_identity = guid_prefix if guid_prefix else src
+
+        occurrences += 1
+
+        unique_samples.add(
+            (
+                writer_identity,
+                writer_entity,
+                sequence
+            )
+        )
+
+    return (
+        occurrences,
+        unique_samples
+    )
+
+def data_sequence_first_times(
+        pcap,
+        display_filter):
+    """
+    Return the first observed time of each unique
+    application DATA sample.
+
+    Sample identity:
+        (writer GUID prefix, writer entity ID,
+         DATA writer sequence number)
+
+    The source IP is used only as a fallback when
+    a GUID prefix is unavailable.
+
+    Only the first rtps.sm.seqNumber occurrence in
+    each DATA frame is used, avoiding HEARTBEAT
+    sequence bounds in DATA+HEARTBEAT frames.
+    """
+
+    rows = run_tshark(
+        pcap,
+        display_filter,
+        [
+            "frame.time_relative",
+            "ip.src",
+            "rtps.guidPrefix.src",
+            "rtps.sm.wrEntityId",
+            "rtps.sm.seqNumber"
+        ],
+        occurrence="f"
+    )
+
+    first_times = {}
+
+    for row in rows:
+        if len(row) < 5:
+            continue
+
+        try:
+            frame_time = float(row[0])
+        except ValueError:
+            continue
+
+        src = row[1].strip()
+        guid_prefix = row[2].strip()
+        writer_entity = row[3].strip()
+        sequence = row[4].strip()
+
+        if not src or not writer_entity or not sequence:
+            continue
+
+        writer_identity = guid_prefix if guid_prefix else src
+
+        key = (
+            writer_identity,
+            writer_entity,
+            sequence
+        )
+
+        if (
+            key not in first_times
+            or frame_time < first_times[key]
+        ):
+            first_times[key] = frame_time
+
+    return first_times
+
+# ============================================================
+# Math helpers
+# ============================================================
+
+def sum_frame_bytes(frame_ids, frames):
+    return sum(
+        frames[frame_id]["len"]
+        for frame_id in frame_ids
+        if frame_id in frames
+    )
+
+
+def mode_frame_length(frame_ids, frames):
+    values = [
+        frames[frame_id]["len"]
+        for frame_id in frame_ids
+        if frame_id in frames
+    ]
+
+    if not values:
+        return None
+
+    return Counter(values).most_common(1)[0][0]
+
+
+def kbps(byte_count, duration):
+    if duration <= 0:
+        return 0.0
+
+    return byte_count * 8.0 / duration / 1000.0
+
+
+def percent(value, total):
+    if total == 0:
+        return 0.0
+
+    return value * 100.0 / total
+
+
+def entity_id_filter(field, values):
+    """Build a tshark filter matching one or more RTPS entity IDs."""
+    terms = [
+        f"{field} == {value}"
+        for value in values
+    ]
+
+    if len(terms) == 1:
+        return terms[0]
+
+    return "(" + " || ".join(terms) + ")"
+
+
+# ============================================================
+# SerializedPayload inference
+# ============================================================
+
+def infer_serialized_payload_size(
+    pcap,
+    writer_filter,
+    interval_filter
+):
+    """
+    Infer SerializedPayload size from RTPS DATA submessages.
+
+    tshark prints all rtps.sm.id values in a frame, e.g.
+
+        0x0e,0x09,0x15,0x80
+
+    and corresponding octetsToNextHeader values:
+
+        12,8,316
+
+    Therefore we correlate the submessage lists by position
+    and extract octetsToNextHeader for DATA (0x15).
+
+    SerializedPayload size:
+        DATA octetsToNextHeader - 20 bytes fixed DATA fields.
+    """
+
+    rows = run_tshark(
+        pcap,
+        (
+            f"rtps.sm.id == {RTPS_DATA} && "
+            f"{writer_filter} && "
+            f"{interval_filter}"
+        ),
+        [
+            "rtps.sm.id",
+            "rtps.sm.octetsToNextHeader"
+        ]
+    )
+
+    data_lengths = []
+
+    for row in rows:
+        if len(row) < 2:
+            continue
+
+        ids = split_multi(row[0])
+        lengths = split_multi(row[1])
+
+        for index, submessage_id in enumerate(ids):
+            if submessage_id != RTPS_DATA:
+                continue
+
+            if index >= len(lengths):
+                continue
+
+            try:
+                length = int(lengths[index])
+            except ValueError:
+                continue
+
+            data_lengths.append(length)
+
+    if not data_lengths:
+        return None, None
+
+    data_octets = Counter(
+        data_lengths
+    ).most_common(1)[0][0]
+
+    serialized_payload_size = (
+        data_octets
+        - DATA_FIXED_BYTES_BEFORE_PAYLOAD
+    )
+
+    if serialized_payload_size <= 0:
+        return None, data_octets
+
+    return serialized_payload_size, data_octets
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Analyze Fast DDS / RTPS bandwidth from a PCAP."
+        )
+    )
+
+    parser.add_argument(
+        "--pcap",
+        required=True,
+        help="Input PCAP file"
+    )
+
+    parser.add_argument(
+        "--writer",
+        required=True,
+        help=(
+            "Application DataWriter entity ID(s), comma-separated, "
+            "e.g. 0x00000103 or "
+            "0x00000103,0x00000203,0x00000303"
+        )
+    )
+
+    parser.add_argument(
+        "--reader",
+        required=True,
+        help=(
+            "Application DataReader entity ID(s), comma-separated, "
+            "e.g. 0x00000204 or "
+            "0x00000204,0x00000604"
+        )
+    )
+
+    parser.add_argument(
+        "--payload-bytes",
+        type=int,
+        required=True,
+        help=(
+            "Configured application payload field size, "
+            "e.g. 256"
+        )
+    )
+
+    parser.add_argument(
+        "--csv",
+        default=None,
+        help="Optional CSV output path"
+    )
+
+    args = parser.parse_args()
+
+    writer_ids = [
+        value.strip()
+        for value in args.writer.split(",")
+        if value.strip()
+    ]
+
+    if not writer_ids:
+        parser.error("--writer must contain at least one entity ID")
+
+    writer_entity_filter = entity_id_filter(
+        "rtps.sm.wrEntityId",
+        writer_ids
+    )
+
+    reader_ids = [
+        value.strip()
+        for value in args.reader.split(",")
+        if value.strip()
+    ]
+
+    if not reader_ids:
+        parser.error("--reader must contain at least one entity ID")
+
+    reader_entity_filter = entity_id_filter(
+        "rtps.sm.rdEntityId",
+        reader_ids
+    )
+
+    if not os.path.isfile(args.pcap):
+        print(
+            f"ERROR: PCAP does not exist: {args.pcap}",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    # ========================================================
+    # 1. Find USER DATA frames
+    # ========================================================
+
+    user_data_filter = (
+        f"rtps.sm.id == {RTPS_DATA} && "
+        f"{writer_entity_filter}"
+    )
+
+    user_data_all = frame_map(
+        args.pcap,
+        user_data_filter
+    )
+
+    if not user_data_all:
+        print("ERROR: No application DATA found.")
+        sys.exit(1)
+
+    user_data_ids = set(user_data_all)
+
+    _, unique_user_data = (
+        data_sequence_stats(
+            args.pcap,
+            user_data_filter
+        )
+    )
+
+    unique_data_first_times = (
+        data_sequence_first_times(
+            args.pcap,
+            user_data_filter
+        )
+    )
+
+    publisher_unique_times = {}
+
+    for (
+        writer_identity,
+        writer_entity,
+        _sequence
+    ), frame_time in unique_data_first_times.items():
+        writer_key = (
+            writer_identity,
+            writer_entity
+        )
+
+        publisher_unique_times.setdefault(
+            writer_key,
+            []
+        ).append(frame_time)
+
+    publisher_windows = {}
+
+    for src, times in publisher_unique_times.items():
+        publisher_windows[src] = {
+            "first": min(times),
+            "last": max(times),
+            "samples": len(times)
+        }
+
+    data_occurrences = len(
+        user_data_ids
+    )
+
+    unique_samples = len(
+        unique_user_data
+    )
+
+    retransmissions = (
+        data_occurrences
+        - unique_samples
+    )
+
+    first_data_frame = min(
+        user_data_all,
+        key=lambda frame_id:
+            user_data_all[frame_id]["time"]
+    )
+
+    last_data_frame = max(
+        user_data_all,
+        key=lambda frame_id:
+            user_data_all[frame_id]["time"]
+    )
+
+    data_start = user_data_all[first_data_frame]["time"]
+    data_end = user_data_all[last_data_frame]["time"]
+
+    data_duration = data_end - data_start
+
+    publisher_ips = sorted({
+        frame["src"]
+        for frame in user_data_all.values()
+        if frame["src"]
+    })
+
+    if not publisher_windows:
+        print(
+            "ERROR: Could not determine publisher DATA windows.",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    steady_start = max(
+        window["first"]
+        for window in publisher_windows.values()
+    )
+
+    steady_end = min(
+        window["last"]
+        for window in publisher_windows.values()
+    )
+
+    steady_duration = (
+        steady_end
+        - steady_start
+    )
+
+    if steady_duration <= 0:
+        print(
+            "ERROR: No common steady-state window exists "
+            "where all publishers are active.",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    steady_interval = (
+        f"frame.time_relative >= {steady_start:.9f} && "
+        f"frame.time_relative <= {steady_end:.9f}"
+    )
+
+    publisher_ip_filter = " || ".join(
+        f"ip.src == {ip}"
+        for ip in publisher_ips
+    )
+
+    transfer_interval = (
+        f"frame.time_relative >= {data_start:.9f} && "
+        f"frame.time_relative <= {data_end:.9f}"
+    )
+
+    samples = unique_samples
+
+    # ========================================================
+    # 2. Check for fragmentation
+    # ========================================================
+
+    data_frag = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_DATA_FRAG} && "
+            f"{transfer_interval}"
+        )
+    )
+
+    if data_frag:
+        print()
+        print(
+            "WARNING: DATA_FRAG detected. "
+            "This analyzer currently targets the "
+            "unfragmented baseline."
+        )
+        print(
+            "Fragmented payload analysis should be added "
+            "before using this script for large messages."
+        )
+
+    # ========================================================
+    # 3. All RTPS traffic in data-transfer window
+    # ========================================================
+
+    all_transfer = frame_map(
+        args.pcap,
+        f"rtps && {transfer_interval}"
+    )
+
+    all_transfer_ids = set(all_transfer)
+
+    total_wire_bytes = sum_frame_bytes(
+        all_transfer_ids,
+        all_transfer
+    )
+
+    # ========================================================
+    # 3A. All RTPS traffic in common steady-state window
+    # ========================================================
+
+    steady_all = frame_map(
+        args.pcap,
+        f"rtps && {steady_interval}"
+    )
+
+    steady_all_ids = set(
+        steady_all
+    )
+
+    steady_total_wire_bytes = sum_frame_bytes(
+        steady_all_ids,
+        steady_all
+    )
+
+    # ========================================================
+    # 4. CmsTopic HEARTBEAT
+    # ========================================================
+
+    app_heartbeat = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_HEARTBEAT} && "
+            f"{writer_entity_filter} && "
+            f"{transfer_interval}"
+        )
+    )
+
+    app_hb_ids = set(app_heartbeat)
+
+    piggyback_hb_ids = (
+        user_data_ids
+        & app_hb_ids
+    )
+
+    standalone_hb_ids = (
+        app_hb_ids
+        - user_data_ids
+    )
+
+    data_without_hb_ids = (
+        user_data_ids
+        - app_hb_ids
+    )
+
+    normal_data_len = mode_frame_length(
+        data_without_hb_ids,
+        user_data_all
+    )
+
+    data_hb_len = mode_frame_length(
+        piggyback_hb_ids,
+        user_data_all
+    )
+
+    hb_increment = 0
+
+    if (
+        normal_data_len is not None
+        and data_hb_len is not None
+    ):
+        hb_increment = (
+            data_hb_len
+            - normal_data_len
+        )
+
+# ========================================================
+# Steady-state traffic breakdown
+# ========================================================
+
+# Application USER DATA
+    steady_user_data = frame_map(
+        args.pcap,
+        (
+            f"{user_data_filter} && "
+            f"{steady_interval}"
+        )
+    )
+
+    steady_user_data_ids = set(
+        steady_user_data
+    )
+
+    _, steady_unique_user_data = (
+        data_sequence_stats(
+            args.pcap,
+            (
+                f"{user_data_filter} && "
+                f"{steady_interval}"
+            )
+        )
+    )
+
+    steady_data_occurrences = len(
+        steady_user_data_ids
+    )
+
+    steady_unique_samples = len(
+        steady_unique_user_data
+    )
+
+    steady_retransmissions = (
+        steady_data_occurrences
+        - steady_unique_samples
+    )
+
+# Application HEARTBEAT
+    steady_app_heartbeat = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_HEARTBEAT} && "
+            f"{writer_entity_filter} && "
+            f"{steady_interval}"
+        )
+    )
+
+    steady_app_hb_ids = set(
+        steady_app_heartbeat
+    )
+
+    steady_piggyback_hb_ids = (
+        steady_user_data_ids
+        & steady_app_hb_ids
+    )
+
+    steady_standalone_hb_ids = (
+        steady_app_hb_ids
+        - steady_user_data_ids
+    )
+
+    steady_piggyback_hb_bytes = (
+        len(steady_piggyback_hb_ids)
+        * hb_increment
+    )
+
+    steady_standalone_hb_bytes = (
+        sum_frame_bytes(
+            steady_standalone_hb_ids,
+            steady_all
+        )
+    )
+
+# Application ACKNACK
+    steady_app_acknack = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_ACKNACK} && "
+            f"{writer_entity_filter} && "
+            f"{reader_entity_filter} && "
+            f"{steady_interval}"
+        )
+    )
+
+    steady_app_ack_ids = set(
+        steady_app_acknack
+    )
+
+# Same fallback used by the full-window analysis
+    if not steady_app_ack_ids:
+        steady_app_acknack = frame_map(
+            args.pcap,
+            (
+                f"rtps.sm.id == {RTPS_ACKNACK} && "
+                f"{writer_entity_filter} && "
+                f"{steady_interval}"
+            )
+        )
+
+        steady_app_ack_ids = set(
+            steady_app_acknack
+        )
+
+    steady_app_ack_bytes = sum_frame_bytes(
+        steady_app_ack_ids,
+        steady_all
+    )
+
+    steady_app_reliability_wire_bytes = (
+        steady_piggyback_hb_bytes
+        + steady_standalone_hb_bytes
+        + steady_app_ack_bytes
+    )
+
+# SPDP
+    steady_spdp = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_DATA} && "
+            f"rtps.sm.wrEntityId == {SPDP_WRITER} && "
+            f"{steady_interval}"
+        )
+    )
+
+    steady_spdp_ids = set(
+        steady_spdp
+    )
+
+    steady_spdp_wire_bytes = sum_frame_bytes(
+        steady_spdp_ids,
+        steady_all
+    )
+
+# SEDP DATA
+    steady_sedp_data = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_DATA} && "
+            f"("
+            f"rtps.sm.wrEntityId == "
+            f"{SEDP_PUBLICATIONS_WRITER} || "
+            f"rtps.sm.wrEntityId == "
+            f"{SEDP_SUBSCRIPTIONS_WRITER}"
+            f") && "
+            f"{steady_interval}"
+        )
+    )
+
+    steady_sedp_data_ids = set(
+        steady_sedp_data
+    )
+
+    steady_sedp_data_wire_bytes = (
+        sum_frame_bytes(
+            steady_sedp_data_ids,
+            steady_all
+        )
+    )
+
+# SEDP HEARTBEAT / ACKNACK
+    steady_sedp_control = frame_map(
+        args.pcap,
+        (
+            f"("
+            f"rtps.sm.id == {RTPS_HEARTBEAT} || "
+            f"rtps.sm.id == {RTPS_ACKNACK}"
+            f") && "
+            f"("
+            f"rtps.sm.wrEntityId == "
+            f"{SEDP_PUBLICATIONS_WRITER} || "
+            f"rtps.sm.wrEntityId == "
+            f"{SEDP_SUBSCRIPTIONS_WRITER}"
+            f") && "
+            f"{steady_interval}"
+        )
+    )
+
+    steady_sedp_control_ids = set(
+        steady_sedp_control
+    )
+
+    steady_sedp_control_wire_bytes = (
+        sum_frame_bytes(
+            steady_sedp_control_ids,
+            steady_all
+        )
+    )
+
+# Remaining RTPS control
+    steady_known_nondata_ids = (
+        steady_standalone_hb_ids
+        | steady_app_ack_ids
+        | steady_spdp_ids
+        | steady_sedp_data_ids
+        | steady_sedp_control_ids
+    )
+
+    steady_other_control_ids = (
+        steady_all_ids
+        - steady_user_data_ids
+        - steady_known_nondata_ids
+    )
+
+    steady_other_control_wire_bytes = (
+        sum_frame_bytes(
+            steady_other_control_ids,
+            steady_all
+        )
+    )
+
+# USER DATA wire cost without piggyback HEARTBEAT
+    steady_raw_user_data_frame_bytes = (
+        sum_frame_bytes(
+            steady_user_data_ids,
+            steady_all
+        )
+    )
+
+    steady_user_data_wire_bytes = (
+        steady_raw_user_data_frame_bytes
+        - steady_piggyback_hb_bytes
+    )
+
+# Discovery total
+    steady_discovery_wire_bytes = (
+        steady_spdp_wire_bytes
+        + steady_sedp_data_wire_bytes
+        + steady_sedp_control_wire_bytes
+    )
+
+# DDS control total
+    steady_dds_control_wire_bytes = (
+        steady_discovery_wire_bytes
+        + steady_app_reliability_wire_bytes
+        + steady_other_control_wire_bytes
+    )
+
+    # Partition consistency
+    steady_reconstructed_total = (
+        steady_user_data_wire_bytes
+        + steady_dds_control_wire_bytes
+    ) 
+
+    steady_partition_error = (
+        steady_total_wire_bytes
+        - steady_reconstructed_total
+    )
+
+
+    piggyback_hb_bytes = (
+        len(piggyback_hb_ids)
+        * hb_increment
+    )
+
+    standalone_hb_bytes = sum_frame_bytes(
+        standalone_hb_ids,
+        all_transfer
+    )
+
+    # ========================================================
+    # 5. CmsTopic ACKNACK
+    # ========================================================
+
+    app_acknack = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_ACKNACK} && "
+            f"{writer_entity_filter} && "
+            f"{reader_entity_filter} && "
+            f"{transfer_interval}"
+        )
+    )
+
+    app_ack_ids = set(app_acknack)
+
+    # Fallback in case this Wireshark version does not expose
+    # rdEntityId for ACKNACK as expected.
+    if not app_ack_ids:
+        app_acknack = frame_map(
+            args.pcap,
+            (
+                f"rtps.sm.id == {RTPS_ACKNACK} && "
+                f"{writer_entity_filter} && "
+                f"{transfer_interval}"
+            )
+        )
+
+        app_ack_ids = set(app_acknack)
+
+    app_ack_bytes = sum_frame_bytes(
+        app_ack_ids,
+        all_transfer
+    )
+
+    app_reliability_wire_bytes = (
+        piggyback_hb_bytes
+        + standalone_hb_bytes
+        + app_ack_bytes
+    )
+
+    # ========================================================
+    # 6. SPDP during data transfer
+    # ========================================================
+
+    spdp_transfer = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_DATA} && "
+            f"rtps.sm.wrEntityId == {SPDP_WRITER} && "
+            f"{transfer_interval}"
+        )
+    )
+
+    spdp_ids = set(spdp_transfer)
+
+    spdp_wire_bytes = sum_frame_bytes(
+        spdp_ids,
+        all_transfer
+    )
+
+    # ========================================================
+    # 7. SEDP DATA during data transfer
+    # ========================================================
+
+    sedp_data_transfer = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_DATA} && "
+            f"("
+            f"rtps.sm.wrEntityId == "
+            f"{SEDP_PUBLICATIONS_WRITER} || "
+            f"rtps.sm.wrEntityId == "
+            f"{SEDP_SUBSCRIPTIONS_WRITER}"
+            f") && "
+            f"{transfer_interval}"
+        )
+    )
+
+    sedp_data_ids = set(sedp_data_transfer)
+
+    sedp_data_wire_bytes = sum_frame_bytes(
+        sedp_data_ids,
+        all_transfer
+    )
+
+    # ========================================================
+    # 8. SEDP reliability control
+    # ========================================================
+
+    sedp_control_transfer = frame_map(
+        args.pcap,
+        (
+            f"("
+            f"rtps.sm.id == {RTPS_HEARTBEAT} || "
+            f"rtps.sm.id == {RTPS_ACKNACK}"
+            f") && "
+            f"("
+            f"rtps.sm.wrEntityId == "
+            f"{SEDP_PUBLICATIONS_WRITER} || "
+            f"rtps.sm.wrEntityId == "
+            f"{SEDP_SUBSCRIPTIONS_WRITER}"
+            f") && "
+            f"{transfer_interval}"
+        )
+    )
+
+    sedp_control_ids = set(
+        sedp_control_transfer
+    )
+
+    sedp_control_wire_bytes = sum_frame_bytes(
+        sedp_control_ids,
+        all_transfer
+    )
+
+    # ========================================================
+    # 9. Identify any remaining RTPS control frames
+    # ========================================================
+
+    known_nondata_ids = (
+        standalone_hb_ids
+        | app_ack_ids
+        | spdp_ids
+        | sedp_data_ids
+        | sedp_control_ids
+    )
+
+    other_control_ids = (
+        all_transfer_ids
+        - user_data_ids
+        - known_nondata_ids
+    )
+
+    other_control_wire_bytes = sum_frame_bytes(
+        other_control_ids,
+        all_transfer
+    )
+
+    # ========================================================
+    # 10. USER DATA base wire cost
+    # ========================================================
+
+    raw_user_data_frame_bytes = sum_frame_bytes(
+        user_data_ids,
+        all_transfer
+    )
+
+    user_data_wire_bytes = (
+        raw_user_data_frame_bytes
+        - piggyback_hb_bytes
+    )
+
+    # ========================================================
+    # 11. Infer SerializedPayload size
+    # ========================================================
+
+    (
+        serialized_payload_size,
+        data_octets_to_next_header
+    ) = infer_serialized_payload_size(
+        args.pcap,
+        writer_entity_filter,
+        transfer_interval
+    )
+
+    if serialized_payload_size is None:
+        print(
+            "ERROR: Could not infer SerializedPayload size.",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    raw_payload_bytes = (
+        samples
+        * args.payload_bytes
+    )
+
+    serialized_payload_bytes = (
+        samples
+        * serialized_payload_size
+    )
+
+    # ========================================================
+    # 12. Protocol/encapsulation overhead
+    # ========================================================
+
+    user_protocol_overhead_bytes = (
+        user_data_wire_bytes
+        - serialized_payload_bytes
+    )
+
+    # ========================================================
+    # 13. Total DDS control traffic
+    # ========================================================
+
+    discovery_wire_bytes = (
+        spdp_wire_bytes
+        + sedp_data_wire_bytes
+        + sedp_control_wire_bytes
+    )
+
+    dds_control_wire_bytes = (
+        discovery_wire_bytes
+        + app_reliability_wire_bytes
+        + other_control_wire_bytes
+    )
+
+    # ========================================================
+    # 14. Total communication overhead
+    # ========================================================
+
+    total_communication_overhead_bytes = (
+        total_wire_bytes
+        - serialized_payload_bytes
+    )
+
+    # ========================================================
+    # 15. Partition consistency check
+    # ========================================================
+
+    reconstructed_total = (
+        user_data_wire_bytes
+        + dds_control_wire_bytes
+    )
+
+    partition_error = (
+        total_wire_bytes
+        - reconstructed_total
+    )
+
+    # ========================================================
+    # 16. STARTUP WINDOW
+    #
+    # Publisher startup:
+    # first RTPS packet emitted by publisher IP
+    #
+    # End:
+    # immediately before first application DATA
+    # ========================================================
+
+    publisher_rtps = frame_map(
+        args.pcap,
+        (
+            f"rtps && "
+            f"({publisher_ip_filter})"
+        )
+    )
+
+    if publisher_rtps:
+        publisher_start = min(
+            frame["time"]
+            for frame in publisher_rtps.values()
+        )
+    else:
+        publisher_start = data_start
+
+    startup_duration = (
+        data_start
+        - publisher_start
+    )
+
+    startup_interval = (
+        f"frame.time_relative >= "
+        f"{publisher_start:.9f} && "
+        f"frame.time_relative < "
+        f"{data_start:.9f}"
+    )
+
+    startup_all = frame_map(
+        args.pcap,
+        f"rtps && {startup_interval}"
+    )
+
+    startup_ids = set(startup_all)
+
+    startup_total_wire_bytes = sum_frame_bytes(
+        startup_ids,
+        startup_all
+    )
+
+    # Startup SPDP DATA
+    startup_spdp = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_DATA} && "
+            f"rtps.sm.wrEntityId == {SPDP_WRITER} && "
+            f"{startup_interval}"
+        )
+    )
+
+    startup_spdp_ids = set(startup_spdp)
+
+    startup_spdp_bytes = sum_frame_bytes(
+        startup_spdp_ids,
+        startup_all
+    )
+
+    # Startup SEDP DATA
+    startup_sedp_data = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_DATA} && "
+            f"("
+            f"rtps.sm.wrEntityId == "
+            f"{SEDP_PUBLICATIONS_WRITER} || "
+            f"rtps.sm.wrEntityId == "
+            f"{SEDP_SUBSCRIPTIONS_WRITER}"
+            f") && "
+            f"{startup_interval}"
+        )
+    )
+
+    startup_sedp_data_ids = set(
+        startup_sedp_data
+    )
+
+    startup_sedp_data_bytes = sum_frame_bytes(
+        startup_sedp_data_ids,
+        startup_all
+    )
+
+    startup_discovery_data_bytes = (
+        startup_spdp_bytes
+        + startup_sedp_data_bytes
+    )
+
+    # Startup HEARTBEAT
+    startup_hb = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_HEARTBEAT} && "
+            f"{startup_interval}"
+        )
+    )
+
+    startup_hb_ids = set(startup_hb)
+
+    startup_hb_bytes = sum_frame_bytes(
+        startup_hb_ids,
+        startup_all
+    )
+
+    # Startup ACKNACK
+    startup_ack = frame_map(
+        args.pcap,
+        (
+            f"rtps.sm.id == {RTPS_ACKNACK} && "
+            f"{startup_interval}"
+        )
+    )
+
+    startup_ack_ids = set(startup_ack)
+
+    startup_ack_bytes = sum_frame_bytes(
+        startup_ack_ids,
+        startup_all
+    )
+
+    startup_known_ids = (
+        startup_spdp_ids
+        | startup_sedp_data_ids
+        | startup_hb_ids
+        | startup_ack_ids
+    )
+
+    startup_other_ids = (
+        startup_ids
+        - startup_known_ids
+    )
+
+    startup_other_bytes = sum_frame_bytes(
+        startup_other_ids,
+        startup_all
+    )
+
+    # ========================================================
+    # 17. Print report
+    # ========================================================
+
+    print()
+    print("=" * 72)
+    print("FAST DDS / RTPS BANDWIDTH ANALYSIS")
+    print("=" * 72)
+
+    print(f"PCAP               : {args.pcap}")
+    print(f"Publisher IP       : {', '.join(publisher_ips)}")
+    print(f"Application Writer : {args.writer}")
+    print(f"Application Reader : {args.reader}")
+
+    print()
+
+    print("=" * 72)
+    print("A. DATA-TRANSFER WINDOW")
+    print("=" * 72)
+
+    print(
+        f"First USER DATA    : "
+        f"{data_start:.9f} s"
+    )
+
+    print(
+        f"Last USER DATA     : "
+        f"{data_end:.9f} s"
+    )
+
+    print(
+        f"Duration           : "
+        f"{data_duration:.9f} s"
+    )
+
+    print(
+        f"DATA occurrences   : "
+        f"{data_occurrences}"
+    )
+
+    print(
+        f"Unique USER DATA   : "
+        f"{unique_samples}"
+    )
+
+    print(
+        f"Retransmissions    : "
+        f"{retransmissions}"
+    )
+
+    print()
+
+    print(
+        f"Raw payload/sample : "
+        f"{args.payload_bytes} B"
+    )
+
+    print(
+        f"DATA octets        : "
+        f"{data_octets_to_next_header} B"
+    )
+
+    print(
+        f"Serialized/sample  : "
+        f"{serialized_payload_size} B"
+    )
+
+    print()
+
+    print(
+        f"DATA only frames   : "
+        f"{len(data_without_hb_ids)}"
+    )
+
+    print(
+        f"DATA + HB frames   : "
+        f"{len(piggyback_hb_ids)}"
+    )
+
+    print(
+        f"HB standalone      : "
+        f"{len(standalone_hb_ids)}"
+    )
+
+    print(
+        f"ACKNACK            : "
+        f"{len(app_ack_ids)}"
+    )
+
+    if normal_data_len is not None:
+        print(
+            f"Normal DATA frame  : "
+            f"{normal_data_len} B"
+        )
+
+    if data_hb_len is not None:
+        print(
+            f"DATA + HB frame    : "
+            f"{data_hb_len} B"
+        )
+
+        print(
+            f"HB increment       : "
+            f"{hb_increment} B"
+        )
+
+    print()
+
+    print(
+        f"{'Metric':38s}"
+        f"{'Bytes':>12s}"
+        f"{'kbps':>12s}"
+        f"{'% total':>12s}"
+    )
+
+    print("-" * 74)
+
+    transfer_metrics = [
+        (
+            "Raw configured payload",
+            raw_payload_bytes
+        ),
+        (
+            "SerializedPayload",
+            serialized_payload_bytes
+        ),
+        (
+            "User-data wire traffic",
+            user_data_wire_bytes
+        ),
+        (
+            "User-data protocol overhead",
+            user_protocol_overhead_bytes
+        ),
+        (
+            "SPDP wire traffic",
+            spdp_wire_bytes
+        ),
+        (
+            "SEDP DATA wire traffic",
+            sedp_data_wire_bytes
+        ),
+        (
+            "SEDP control wire traffic",
+            sedp_control_wire_bytes
+        ),
+        (
+            "CmsTopic reliability wire",
+            app_reliability_wire_bytes
+        ),
+        (
+            "Other RTPS control",
+            other_control_wire_bytes
+        ),
+        (
+            "DDS control wire traffic",
+            dds_control_wire_bytes
+        ),
+        (
+            "Communication overhead",
+            total_communication_overhead_bytes
+        ),
+        (
+            "TOTAL RTPS wire traffic",
+            total_wire_bytes
+        )
+    ]
+
+    for name, value in transfer_metrics:
+        print(
+            f"{name:38s}"
+            f"{value:12d}"
+            f"{kbps(value, data_duration):12.3f}"
+            f"{percent(value, total_wire_bytes):12.3f}"
+        )
+
+    print()
+
+    print(
+        f"DDS control ratio          : "
+        f"{percent(dds_control_wire_bytes, total_wire_bytes):.3f}%"
+    )
+
+    print(
+        f"Communication overhead     : "
+        f"{percent(total_communication_overhead_bytes, total_wire_bytes):.3f}%"
+    )
+
+    print(
+        f"SPDP ratio                 : "
+        f"{percent(spdp_wire_bytes, total_wire_bytes):.3f}%"
+    )
+
+    print(
+        f"SEDP control ratio         : "
+        f"{percent(sedp_control_wire_bytes, total_wire_bytes):.3f}%"
+    )
+
+    print(
+        f"CmsTopic reliability ratio : "
+        f"{percent(app_reliability_wire_bytes, total_wire_bytes):.3f}%"
+    )
+
+    print()
+
+    print(
+        f"Partition check            : "
+        f"{reconstructed_total} / "
+        f"{total_wire_bytes} B"
+    )
+
+    print(
+        f"Partition error            : "
+        f"{partition_error} B"
+    )
+
+    if other_control_ids:
+        print()
+        print(
+            f"WARNING: {len(other_control_ids)} "
+            f"unclassified RTPS frame(s) "
+            f"in data-transfer window."
+        )
+
+    # ========================================================
+    # Startup output
+    # ========================================================
+
+    print()
+    print("=" * 72)
+    print("B. STARTUP / INITIAL DISCOVERY WINDOW")
+    print("=" * 72)
+
+    print(
+        f"Publisher first RTPS : "
+        f"{publisher_start:.9f} s"
+    )
+
+    print(
+        f"First USER DATA      : "
+        f"{data_start:.9f} s"
+    )
+
+    print(
+        f"Startup duration     : "
+        f"{startup_duration:.9f} s"
+    )
+
+    print(
+        f"Startup RTPS frames  : "
+        f"{len(startup_ids)}"
+    )
+
+    print()
+
+    startup_metrics = [
+        (
+            "Startup SPDP DATA",
+            startup_spdp_bytes
+        ),
+        (
+            "Startup SEDP DATA",
+            startup_sedp_data_bytes
+        ),
+        (
+            "Startup discovery DATA",
+            startup_discovery_data_bytes
+        ),
+        (
+            "Startup HEARTBEAT",
+            startup_hb_bytes
+        ),
+        (
+            "Startup ACKNACK",
+            startup_ack_bytes
+        ),
+        (
+            "Startup other RTPS",
+            startup_other_bytes
+        ),
+        (
+            "Startup TOTAL",
+            startup_total_wire_bytes
+        )
+    ]
+
+    print(
+        f"{'Metric':38s}"
+        f"{'Frames':>10s}"
+        f"{'Bytes':>12s}"
+        f"{'kbps':>12s}"
+    )
+
+    print("-" * 72)
+
+    startup_frame_counts = {
+        "Startup SPDP DATA":
+            len(startup_spdp_ids),
+
+        "Startup SEDP DATA":
+            len(startup_sedp_data_ids),
+
+        "Startup discovery DATA":
+            len(
+                startup_spdp_ids
+                | startup_sedp_data_ids
+            ),
+
+        "Startup HEARTBEAT":
+            len(startup_hb_ids),
+
+        "Startup ACKNACK":
+            len(startup_ack_ids),
+
+        "Startup other RTPS":
+            len(startup_other_ids),
+
+        "Startup TOTAL":
+            len(startup_ids)
+    }
+
+    for name, value in startup_metrics:
+        print(
+            f"{name:38s}"
+            f"{startup_frame_counts[name]:10d}"
+            f"{value:12d}"
+            f"{kbps(value, startup_duration):12.3f}"
+        )
+
+    print()
+
+    print(
+        f"Startup total rate   : "
+        f"{kbps(startup_total_wire_bytes, startup_duration):.3f} kbps"
+    )
+
+    startup_reconstructed = (
+        startup_discovery_data_bytes
+        + startup_hb_bytes
+        + startup_ack_bytes
+        + startup_other_bytes
+    )
+
+    startup_partition_error = (
+        startup_total_wire_bytes
+        - startup_reconstructed
+    )
+
+    print(
+        f"Startup partition    : "
+        f"{startup_reconstructed} / "
+        f"{startup_total_wire_bytes} B"
+    )
+
+    print(
+        f"Startup error        : "
+        f"{startup_partition_error} B"
+    )
+
+# ========================================================
+# Common steady-state output
+# ========================================================
+
+    print()
+    print("=" * 72)
+    print("C. COMMON STEADY-STATE WINDOW")
+    print("=" * 72)
+
+    print(
+        f"Steady start       : "
+        f"{steady_start:.9f} s"
+    )
+
+    print(
+        f"Steady end         : "
+        f"{steady_end:.9f} s"
+    )
+
+    print(
+        f"Steady duration    : "
+        f"{steady_duration:.9f} s"
+    )
+
+    print(
+        f"Active publishers  : "
+        f"{len(publisher_windows)}"
+    )
+
+    print(
+        f"Steady DATA occurrences : "
+        f"{steady_data_occurrences}"
+    )
+
+    print(
+        f"Steady unique DATA      : "
+        f"{steady_unique_samples}"
+    )
+
+    print(
+        f"Steady retransmissions  : "
+        f"{steady_retransmissions}"
+    )
+
+    print()
+
+    print(
+        f"{'Metric':38s}"
+        f"{'Bytes':>12s}"
+        f"{'kbps':>12s}"
+        f"{'% total':>12s}"
+    )
+
+    print("-" * 74)
+
+    steady_metrics = [
+        (
+            "Steady USER DATA wire",
+            steady_user_data_wire_bytes
+        ),
+        (
+            "Steady SPDP wire",
+            steady_spdp_wire_bytes
+        ),
+        (
+            "Steady SEDP DATA wire",
+            steady_sedp_data_wire_bytes
+        ),
+        (
+            "Steady SEDP control wire",
+            steady_sedp_control_wire_bytes
+        ),
+        ( 
+            "Steady CmsTopic reliability",
+            steady_app_reliability_wire_bytes
+        ),
+        (
+            "Steady other RTPS control",
+            steady_other_control_wire_bytes
+        ),
+        (
+            "Steady DDS control wire",
+            steady_dds_control_wire_bytes
+        ),
+        (
+            "Steady TOTAL RTPS wire",
+            steady_total_wire_bytes
+        )
+    ]
+
+    for name, value in steady_metrics:
+        print(
+            f"{name:38s}"
+            f"{value:12d}"
+            f"{kbps(value, steady_duration):12.3f}"
+            f"{percent(value, steady_total_wire_bytes):12.3f}"
+        )
+
+    print()
+
+    print(
+        f"Steady discovery ratio   : "
+        f"{percent(steady_discovery_wire_bytes, steady_total_wire_bytes):.3f}%"
+    )
+
+    print(
+        f"Steady reliability ratio : "
+        f"{percent(steady_app_reliability_wire_bytes, steady_total_wire_bytes):.3f}%"
+    )
+
+    print(
+        f"Steady DDS control ratio : "
+        f"{percent(steady_dds_control_wire_bytes, steady_total_wire_bytes):.3f}%"
+    )
+
+    print(
+        f"Steady partition error   : "
+        f"{steady_partition_error} B"
+    )
+
+    # ========================================================
+    # 18. Optional CSV
+    # ========================================================
+
+    if args.csv:
+        csv_dir = os.path.dirname(args.csv)
+
+        if csv_dir:
+            os.makedirs(
+                csv_dir,
+                exist_ok=True
+            )
+
+        with open(
+            args.csv,
+            "w",
+            newline=""
+        ) as csv_file:
+            writer = csv.writer(csv_file)
+
+            writer.writerow([
+                "phase",
+                "metric",
+                "bytes",
+                "kbps",
+                "percent_total"
+            ])
+
+            for name, value in transfer_metrics:
+                writer.writerow([
+                    "data_transfer",
+                    name,
+                    value,
+                    kbps(
+                        value,
+                        data_duration
+                    ),
+                    percent(
+                        value,
+                        total_wire_bytes
+                    )
+                ])
+
+            for name, value in startup_metrics:
+                writer.writerow([
+                    "startup",
+                    name,
+                    value,
+                    kbps(
+                        value,
+                        startup_duration
+                    ),
+                    ""
+                ])
+
+            for name, value in steady_metrics:
+                writer.writerow([
+                    "steady_state",
+                    name,
+                    value,
+                    kbps(
+                        value,
+                        steady_duration
+                    ),
+                    percent(
+                        value,
+                        steady_total_wire_bytes
+                    )
+                ])
+
+        print()
+        print(
+            f"CSV written to      : "
+            f"{args.csv}"
+        )
+
+    print()
+    print("=" * 72)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,870 @@
+#include <fastdds/dds/domain/DomainParticipant.hpp>
+#include <fastdds/dds/domain/DomainParticipantFactory.hpp>
+
+#include <fastdds/dds/subscriber/DataReader.hpp>
+#include <fastdds/dds/subscriber/DataReaderListener.hpp>
+#include <fastdds/dds/subscriber/Subscriber.hpp>
+
+#include <fastdds/dds/topic/Topic.hpp>
+#include <fastdds/dds/topic/TypeSupport.hpp>
+
+#include "CmsMessage.hpp"
+#include "CmsMessagePubSubTypes.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <numeric>
+#include <string>
+#include <thread>
+#include <time.h>
+#include <vector>
+
+using namespace eprosima::fastdds::dds;
+
+namespace
+{
+
+uint64_t monotonic_time_ns()
+{
+    timespec ts{};
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &ts);
+
+    return
+        static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
+        static_cast<uint64_t>(ts.tv_nsec);
+}
+
+struct Options
+{
+    uint64_t count = 1000;
+
+    double deadline_ms = 8.0;
+
+    uint64_t idle_timeout_ms = 0;
+
+    std::string csv_path =
+        "../results/dds_latency.csv";
+    
+    std::string qos_path =
+        "../config/qos_baseline.xml";
+
+};
+
+struct SampleRecord
+{
+    uint32_t node_id = 0;
+
+    uint32_t flow_id = 0;
+
+    uint64_t sequence_number = 0;
+
+    uint8_t traffic_type = 0;
+
+    std::size_t payload_bytes = 0;
+
+    uint64_t send_timestamp_ns = 0;
+
+    uint64_t receive_timestamp_ns = 0;
+
+    double latency_ms = 0.0;
+
+    double deadline_ms = 0.0;
+
+    bool deadline_miss = false;
+};
+
+void print_usage(
+        const char* program)
+{
+    std::cout
+        << "Usage:\n"
+        << "  "
+        << program
+        << " [--count N]"
+        << " [--deadline-ms N]"
+        << " [--idle-timeout-ms N]"    
+        << " [--qos FILE]"
+        << " [--csv FILE]\n";
+}
+
+bool parse_arguments(
+        int argc,
+        char** argv,
+        Options& options)
+{
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg =
+            argv[i];
+
+        if (arg == "--count" &&
+                i + 1 < argc)
+        {
+            options.count =
+                std::stoull(
+                    argv[++i]);
+        }
+        else if (arg == "--deadline-ms" &&
+                i + 1 < argc)
+        {
+            options.deadline_ms =
+                std::stod(
+                    argv[++i]);
+        }
+
+        else if (arg == "--idle-timeout-ms" &&
+                i + 1 < argc)
+        {
+            options.idle_timeout_ms =
+                std::stoull(
+                argv[++i]);
+        }
+
+        else if (arg == "--qos" &&
+                i + 1 < argc)
+        {
+            options.qos_path =
+                argv[++i];
+        }
+
+        else if (arg == "--csv" &&
+                i + 1 < argc)
+        {
+            options.csv_path =
+                argv[++i];
+        }
+        else if (arg == "--help")
+        {
+            print_usage(
+                argv[0]);
+
+            std::exit(0);
+        }
+        else
+        {
+            std::cerr
+                << "Unknown or incomplete argument: "
+                << arg
+                << '\n';
+
+            return false;
+        }
+    }
+
+    if (options.count == 0)
+    {
+        std::cerr
+            << "count must be > 0\n";
+
+        return false;
+    }
+
+    if (options.deadline_ms <= 0.0)
+    {
+        std::cerr
+            << "deadline-ms must be > 0\n";
+
+        return false;
+    }
+
+    return true;
+}
+
+double percentile(
+        const std::vector<double>& sorted_values,
+        double p)
+{
+    if (sorted_values.empty())
+    {
+        return 0.0;
+    }
+
+    const std::size_t n =
+        sorted_values.size();
+
+    std::size_t index =
+        static_cast<std::size_t>(
+            std::ceil(
+                p *
+                static_cast<double>(n)));
+
+    if (index == 0)
+    {
+        index = 1;
+    }
+
+    index -= 1;
+
+    if (index >= n)
+    {
+        index = n - 1;
+    }
+
+    return
+        sorted_values[index];
+}
+
+class CmsSubscriber
+{
+private:
+
+    class SubscriberListener :
+        public DataReaderListener
+    {
+    public:
+
+        std::atomic<uint64_t> received{0};
+
+        std::atomic<uint64_t> deadline_misses{0};
+
+        std::atomic_int matched{0};
+
+        uint64_t expected_count;
+
+        double deadline_ms;
+
+        std::vector<SampleRecord> records;
+
+        std::mutex records_mutex;
+
+        SubscriberListener(
+                uint64_t expected,
+                double deadline)
+            : expected_count(expected),
+              deadline_ms(deadline)
+        {
+            records.reserve(
+                static_cast<std::size_t>(
+                    expected_count));
+        }
+
+        void on_subscription_matched(
+                DataReader*,
+                const SubscriptionMatchedStatus& info) override
+        {
+            matched =
+                info.current_count;
+
+            if (info.current_count_change > 0)
+            {
+                std::cout
+                    << "[DDS] Publisher matched. "
+                    << "current writers = "
+                    << info.current_count
+                    << '\n';
+            }
+            else if (info.current_count_change < 0)
+            {
+                std::cout
+                    << "[DDS] Publisher unmatched. "
+                    << "current writers = "
+                    << info.current_count
+                    << '\n';
+            }
+        }
+
+void on_sample_rejected(
+        DataReader*,
+        const SampleRejectedStatus& info) override
+{
+    std::cerr
+        << "[DDS] SAMPLE REJECTED"
+        << " change=" << info.total_count_change
+        << " total=" << info.total_count
+        << " reason="
+        << static_cast<int>(info.last_reason)
+        << '\n';
+}
+
+void on_sample_lost(
+        DataReader*,
+        const SampleLostStatus& info) override
+{
+    std::cerr
+        << "[DDS] SAMPLE LOST"
+        << " change=" << info.total_count_change
+        << " total=" << info.total_count
+        << '\n';
+}
+
+        void on_data_available(
+                DataReader* reader) override
+        {
+            cms::CmsMessage message;
+
+            SampleInfo info;
+
+            while (
+                reader->take_next_sample(
+                    &message,
+                    &info) == RETCODE_OK)
+            {
+                if (!info.valid_data)
+                {
+                    continue;
+                }
+
+                const uint64_t receive_timestamp_ns =
+                    monotonic_time_ns();
+
+                const uint64_t send_timestamp_ns =
+                    message.send_timestamp_ns();
+
+                double latency_ms =
+                    -1.0;
+
+                if (receive_timestamp_ns >=
+                        send_timestamp_ns)
+                {
+                    latency_ms =
+                        static_cast<double>(
+                            receive_timestamp_ns -
+                            send_timestamp_ns) /
+                        1e6;
+                }
+
+                const bool deadline_miss =
+                    latency_ms < 0.0 ||
+                    latency_ms > deadline_ms;
+
+                if (deadline_miss)
+                {
+                    ++deadline_misses;
+                }
+
+                SampleRecord record;
+
+                record.node_id =
+                    message.node_id();
+
+                record.flow_id =
+                    message.flow_id();
+
+                record.sequence_number =
+                    message.sequence_number();
+
+                record.traffic_type =
+                    message.traffic_type();
+
+                record.payload_bytes =
+                    message.payload().size();
+
+                record.send_timestamp_ns =
+                    send_timestamp_ns;
+
+                record.receive_timestamp_ns =
+                    receive_timestamp_ns;
+
+                record.latency_ms =
+                    latency_ms;
+
+                record.deadline_ms =
+                    deadline_ms;
+
+                record.deadline_miss =
+                    deadline_miss;
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        records_mutex);
+
+                    records.push_back(
+                        record);
+                }
+
+                const uint64_t current =
+                    ++received;
+
+                if (current <= 5 ||
+                        current == expected_count ||
+                        deadline_miss)
+                {
+                    std::cout
+                        << std::fixed
+                        << std::setprecision(3)
+                        << "RECV"
+                        << " node="
+                        << message.node_id()
+                        << " flow="
+                        << message.flow_id()
+                        << " seq="
+                        << message.sequence_number()
+                        << " payload="
+                        << message.payload().size()
+                        << " B"
+                        << " latency="
+                        << latency_ms
+                        << " ms"
+                        << " deadline_miss="
+                        << (deadline_miss ?
+                            "YES" :
+                            "NO")
+                        << '\n';
+                }
+            }
+        }
+    };
+
+    DomainParticipant* participant_ =
+        nullptr;
+
+    Subscriber* subscriber_ =
+        nullptr;
+
+    Topic* topic_ =
+        nullptr;
+
+    DataReader* reader_ =
+        nullptr;
+
+    TypeSupport type_;
+
+    SubscriberListener listener_;
+
+public:
+
+    CmsSubscriber(
+            uint64_t expected_count,
+            double deadline_ms)
+        : type_(
+              new cms::CmsMessagePubSubType()),
+          listener_(
+              expected_count,
+              deadline_ms)
+    {
+    }
+
+    ~CmsSubscriber()
+    {
+        if (subscriber_ != nullptr &&
+                reader_ != nullptr)
+        {
+            subscriber_->delete_datareader(
+                reader_);
+        }
+
+        if (participant_ != nullptr &&
+                subscriber_ != nullptr)
+        {
+            participant_->delete_subscriber(
+                subscriber_);
+        }
+
+        if (participant_ != nullptr &&
+                topic_ != nullptr)
+        {
+            participant_->delete_topic(
+                topic_);
+        }
+
+        if (participant_ != nullptr)
+        {
+            DomainParticipantFactory::get_instance()
+                ->delete_participant(
+                    participant_);
+        }
+    }
+
+    bool init( 
+            const std::string& qos_path)
+    {
+        if (DomainParticipantFactory::get_instance()
+                ->load_XML_profiles_file(
+                    qos_path) != RETCODE_OK)
+        {
+            std::cerr
+                << "Failed to load QoS XML: "
+                << qos_path
+                << '\n';
+
+            return false;
+        }
+
+        std::cout
+            << "Loaded QoS XML: "
+            << qos_path
+            << '\n';
+        participant_ =
+            DomainParticipantFactory::get_instance()
+                ->create_participant(
+                    0,
+                    PARTICIPANT_QOS_DEFAULT);
+
+        if (participant_ == nullptr)
+        {
+            std::cerr
+                << "Failed to create DomainParticipant.\n";
+
+            return false;
+        }
+
+        if (type_.register_type(
+                participant_) != RETCODE_OK)
+        {
+            std::cerr
+                << "Failed to register CmsMessage type.\n";
+
+            return false;
+        }
+
+        topic_ =
+            participant_->create_topic(
+                "CmsTopic",
+                type_.get_type_name(),
+                TOPIC_QOS_DEFAULT);
+
+        if (topic_ == nullptr)
+        {
+            std::cerr
+                << "Failed to create CmsTopic.\n";
+
+            return false;
+        }
+
+        subscriber_ =
+            participant_->create_subscriber(
+                SUBSCRIBER_QOS_DEFAULT);
+
+        if (subscriber_ == nullptr)
+        {
+            std::cerr
+                << "Failed to create Subscriber.\n";
+
+            return false;
+        }
+
+        reader_ =
+            subscriber_->create_datareader_with_profile(
+                topic_,
+                "cms_reader_profile",
+                &listener_);
+
+        if (reader_ == nullptr)
+        {
+            std::cerr
+                << "Failed to create DataReader.\n";
+
+            return false;
+        }
+
+        std::cout
+            << "CMS subscriber initialized.\n"
+            << "Domain: 0\n"
+            << "Topic : CmsTopic\n";
+
+        return true;
+    }
+
+    bool save_results(
+            const std::string& csv_path)
+    {
+        std::vector<SampleRecord> records;
+
+        {
+            std::lock_guard<std::mutex> lock(
+                listener_.records_mutex);
+
+            records =
+                listener_.records;
+        }
+
+        std::ofstream out(
+            csv_path);
+
+        if (!out.is_open())
+        {
+            std::cerr
+                << "Failed to open CSV: "
+                << csv_path
+                << '\n';
+
+            return false;
+        }
+
+        out
+            << "node_id,"
+            << "flow_id,"
+            << "sequence_number,"
+            << "traffic_type,"
+            << "payload_bytes,"
+            << "send_timestamp_ns,"
+            << "receive_timestamp_ns,"
+            << "latency_ms,"
+            << "deadline_ms,"
+            << "deadline_miss\n";
+
+        std::vector<double> latencies;
+
+        latencies.reserve(
+            records.size());
+
+        for (const auto& record : records)
+        {
+            out
+                << record.node_id
+                << ','
+                << record.flow_id
+                << ','
+                << record.sequence_number
+                << ','
+                << static_cast<unsigned>(
+                    record.traffic_type)
+                << ','
+                << record.payload_bytes
+                << ','
+                << record.send_timestamp_ns
+                << ','
+                << record.receive_timestamp_ns
+                << ','
+                << std::fixed
+                << std::setprecision(6)
+                << record.latency_ms
+                << ','
+                << record.deadline_ms
+                << ','
+                << (record.deadline_miss ?
+                    1 :
+                    0)
+                << '\n';
+
+            if (record.latency_ms >= 0.0)
+            {
+                latencies.push_back(
+                    record.latency_ms);
+            }
+        }
+
+        out.close();
+
+        if (latencies.empty())
+        {
+            std::cerr
+                << "No valid latency samples.\n";
+
+            return false;
+        }
+
+        std::sort(
+            latencies.begin(),
+            latencies.end());
+
+        const double sum =
+            std::accumulate(
+                latencies.begin(),
+                latencies.end(),
+                0.0);
+
+        const double mean =
+            sum /
+            static_cast<double>(
+                latencies.size());
+
+        double miss_percent =
+            0.0;
+
+        if (!records.empty())
+        {
+            miss_percent =
+                100.0 *
+                static_cast<double>(
+                    listener_.deadline_misses.load()) /
+                static_cast<double>(
+                    records.size());
+        }
+
+        std::cout
+            << "\n===== LATENCY SUMMARY =====\n"
+            << std::fixed
+            << std::setprecision(3)
+            << "samples       = "
+            << latencies.size()
+            << '\n'
+            << "min           = "
+            << latencies.front()
+            << " ms\n"
+            << "mean          = "
+            << mean
+            << " ms\n"
+            << "p95           = "
+            << percentile(
+                latencies,
+                0.95)
+            << " ms\n"
+            << "p99           = "
+            << percentile(
+                latencies,
+                0.99)
+            << " ms\n"
+            << "max           = "
+            << latencies.back()
+            << " ms\n"
+            << "deadline      = "
+            << listener_.deadline_ms
+            << " ms\n"
+            << "deadline miss = "
+            << listener_.deadline_misses.load()
+            << " ("
+            << miss_percent
+            << "%)\n"
+            << "CSV           = "
+            << csv_path
+            << '\n';
+
+        return true;
+    }
+
+    void run(
+            const std::string& csv_path,
+            uint64_t idle_timeout_ms)
+    {
+        std::cout
+            << "Waiting for DDS samples...\n";
+
+uint64_t last_received = 0;
+
+bool reception_started = false;
+
+auto last_progress =
+    std::chrono::steady_clock::now();
+
+while (
+        listener_.received.load() <
+        listener_.expected_count)
+{
+    const uint64_t current_received =
+        listener_.received.load();
+
+    if (current_received > 0)
+    {
+        reception_started = true;
+    }
+
+    if (current_received != last_received)
+    {
+        last_received =
+            current_received;
+
+        last_progress =
+            std::chrono::steady_clock::now();
+    }
+
+    if (idle_timeout_ms > 0 &&
+            reception_started)
+    {
+        const auto now =
+            std::chrono::steady_clock::now();
+
+        const auto idle_ms =
+            std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                    now - last_progress)
+                .count();
+
+        if (idle_ms >=
+                static_cast<int64_t>(
+                    idle_timeout_ms))
+        {
+            break;
+        }
+    }
+
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(
+            100));
+}
+
+const uint64_t final_received =
+    listener_.received.load();
+
+if (final_received >=
+        listener_.expected_count)
+{
+    std::cout
+        << "\nReception completed.\n";
+}
+else
+{
+    std::cout
+        << "\nReception incomplete.\n"
+        << "expected        = "
+        << listener_.expected_count
+        << '\n'
+        << "missing         = "
+        << listener_.expected_count -
+            final_received
+        << '\n';
+}
+
+std::cout
+    << "received        = "
+    << final_received
+    << '\n'
+    << "deadline misses = "
+    << listener_.deadline_misses.load()
+    << '\n';
+
+save_results(
+    csv_path);
+
+
+    }
+};
+
+} // namespace
+
+int main(
+        int argc,
+        char** argv)
+{
+    Options options;
+
+    try
+    {
+        if (!parse_arguments(
+                argc,
+                argv,
+                options))
+        {
+            print_usage(
+                argv[0]);
+
+            return 1;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr
+            << "Invalid argument: "
+            << e.what()
+            << '\n';
+
+        return 1;
+    }
+
+    CmsSubscriber subscriber(
+        options.count,
+        options.deadline_ms);
+
+    if (!subscriber.init(
+            options.qos_path))
+    {
+        return 1;
+    }
+
+    subscriber.run(
+        options.csv_path,
+        options.idle_timeout_ms);
+
+    return 0;
+}

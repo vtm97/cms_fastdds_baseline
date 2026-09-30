@@ -1,0 +1,14 @@
+version: v5.0
+
+allowlist:
+  - name: CmsTopic
+
+participants:
+
+  - name: SourceDomain
+    kind: local
+    domain: 0
+
+  - name: CmsDomain
+    kind: local
+    domain: 1

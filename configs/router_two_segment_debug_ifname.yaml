@@ -1,0 +1,39 @@
+version: v5.0
+
+builtin-topics:
+  - name: CmsTopic
+    type: "cms::CmsMessage"
+
+allowlist:
+  - name: CmsTopic
+    type: "cms::CmsMessage"
+
+topics:
+  - name: CmsTopic
+    type: "cms::CmsMessage"
+    qos:
+      reliability: true
+
+participants:
+  - name: SourceDomain
+    kind: local
+    domain: 0
+    transport: udp
+    whitelist-interfaces:
+      - "rsrc-ns"
+
+  - name: CmsDomain
+    kind: local
+    domain: 1
+    transport: udp
+    whitelist-interfaces:
+      - "rcms-ns"
+
+specs:
+  logging:
+    verbosity: info
+    filter:
+      error: "DDSPIPE|DDSROUTER"
+      warning: "DDSPIPE|DDSROUTER"
+      info: "DDSPIPE|DDSROUTER"
+    stdout: true

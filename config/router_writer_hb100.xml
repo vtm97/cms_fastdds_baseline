@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<dds>
+  <profiles xmlns="http://www.eprosima.com">
+
+    <data_writer
+        profile_name="router_writer_hb100"
+        is_default_profile="true">
+
+      <times>
+        <heartbeat_period>
+          <sec>0</sec>
+          <nanosec>100000000</nanosec>
+        </heartbeat_period>
+
+        <nack_response_delay>
+          <sec>0</sec>
+          <nanosec>5000000</nanosec>
+        </nack_response_delay>
+      </times>
+
+    </data_writer>
+
+  </profiles>
+</dds>

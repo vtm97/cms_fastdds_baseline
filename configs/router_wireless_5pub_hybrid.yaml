@@ -1,0 +1,15 @@
+version: v5.0
+
+participants:
+
+  - name: SourceDomain
+    kind: local
+    domain: 0
+    transport: udp
+
+  - name: CmsDomain
+    kind: local
+    domain: 1
+    transport: udp
+    whitelist-interfaces:
+      - "192.168.50.1"

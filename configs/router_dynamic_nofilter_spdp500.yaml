@@ -1,0 +1,32 @@
+version: v5.0
+
+xml:
+  raw: |
+    <?xml version="1.0" encoding="UTF-8" ?>
+    <profiles xmlns="http://www.eprosima.com">
+        <participant profile_name="source_domain_spdp500">
+            <domainId>0</domainId>
+            <rtps>
+                <builtin>
+                    <discovery_config>
+                        <leaseAnnouncement>
+                            <sec>0</sec>
+                            <nanosec>500000000</nanosec>
+                        </leaseAnnouncement>
+                    </discovery_config>
+                </builtin>
+            </rtps>
+        </participant>
+    </profiles>
+
+participants:
+  - name: SourceDomain
+    kind: xml
+    profile: source_domain_spdp500
+
+  - name: CmsDomain
+    kind: local
+    domain: 1
+    transport: udp
+    whitelist-interfaces:
+      - "192.168.50.1"

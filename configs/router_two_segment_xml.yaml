@@ -1,0 +1,37 @@
+version: v5.0
+
+xml:
+  files:
+    - "/home/mung/cms_fastdds_baseline/configs/router_two_segment_participants.xml"
+
+builtin-topics:
+  - name: CmsTopic
+    type: "cms::CmsMessage"
+
+allowlist:
+  - name: CmsTopic
+    type: "cms::CmsMessage"
+
+topics:
+  - name: CmsTopic
+    type: "cms::CmsMessage"
+    qos:
+      reliability: true
+
+participants:
+  - name: SourceDomain
+    kind: xml
+    profile: router_source_profile
+
+  - name: CmsDomain
+    kind: xml
+    profile: router_cms_profile
+
+specs:
+  logging:
+    verbosity: info
+    filter:
+      error: "DDSPIPE|DDSROUTER"
+      warning: "DDSPIPE|DDSROUTER"
+      info: "DDSPIPE|DDSROUTER"
+    stdout: true

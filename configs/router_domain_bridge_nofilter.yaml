@@ -1,0 +1,11 @@
+version: v5.0
+
+participants:
+
+  - name: SourceDomain
+    kind: local
+    domain: 0
+
+  - name: CmsDomain
+    kind: local
+    domain: 1

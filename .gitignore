@@ -1,0 +1,40 @@
+# Build artifacts
+/build/
+/build_rtt/
+/CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Packet captures
+*.pcap
+*.pcapng
+/pcap/
+
+# Logs
+/logs/
+*.log
+
+# Local backup
+/backup_before_payload_mtu/
+
+# Temporary / editor files
+*.before_runtime_fix
+*.bak
+*.tmp
+*~
+.DS_Store
+.vscode/
+.idea/
+*.before_runtime_fix
+/NOP_MENTOR_2_NHAN_XET_20260910/
+
+# Experimental outputs - not needed to reproduce/build
+/results/
+/NOP_MENTOR_2_NHAN_XET_20260910/
+
+# Root-level experiment outputs
+/wifi_*.csv
+/wifi_*.txt
+/smoke_*.csv
+/smoke_*.log

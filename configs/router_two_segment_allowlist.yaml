@@ -1,0 +1,20 @@
+version: v5.0
+
+allowlist:
+  - name: CmsTopic
+
+participants:
+
+  - name: SourceDomain
+    kind: local
+    domain: 0
+    transport: udp
+    whitelist-interfaces:
+      - "10.10.0.1"
+
+  - name: CmsDomain
+    kind: local
+    domain: 1
+    transport: udp
+    whitelist-interfaces:
+      - "10.20.0.1"

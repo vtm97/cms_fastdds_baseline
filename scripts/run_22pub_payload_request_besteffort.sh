@@ -1,0 +1,63 @@
+#!/bin/bash
+set -u
+
+# Refresh sudo credential once before spawning 22 background clients.
+# This prevents every "sudo -n ip netns exec" from failing when
+# the cached sudo ticket has expired.
+if ! sudo -v; then
+    echo "ERROR: sudo authentication failed"
+    exit 2
+fi
+
+
+if [ "$#" -ne 2 ]; then
+    echo "Usage: $0 PAYLOAD_BYTES RUN_LABEL"
+    echo "Example: $0 256 payload_256B_nofilter_run01"
+    exit 1
+fi
+
+PAYLOAD="$1"
+LABEL="$2"
+
+BASE="/home/mung/cms_fastdds_baseline"
+OUT="$BASE/results/$LABEL"
+
+mkdir -p "$OUT"
+
+PIDS=""
+FAIL=0
+
+for i in $(seq 1 22); do
+    sudo -n ip netns exec pub${i}_ns bash -lc "
+        cd $BASE
+        export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+
+        ./build_rtt/cms_rtt_client \
+          --domain-id 0 \
+          --request-topic CmsRttRequest \
+          --echo-topic CmsRttEcho${i} \
+          --node-id ${i} \
+          --flow-id 1 \
+          --count 1000 \
+          --warmup-count 20 \
+          --payload-bytes ${PAYLOAD} \
+          --period-ms 16 \
+          --deadline-ms 8 \
+          --response-timeout-ms 10000 \
+          --qos ./config/qos_request_besteffort_echo_reliable.xml \
+          --csv $OUT/node${i}.csv
+    " > "$OUT/node${i}.log" 2>&1 &
+
+    PIDS="$PIDS $!"
+done
+
+for p in $PIDS; do
+    if ! wait "$p"; then
+        FAIL=1
+    fi
+done
+
+echo "===== 22PUB PAYLOAD RUN COMPLETE ====="
+echo "PAYLOAD=$PAYLOAD"
+echo "LABEL=$LABEL"
+echo "FAIL=$FAIL"

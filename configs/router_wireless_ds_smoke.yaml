@@ -1,0 +1,14 @@
+version: v5.0
+
+participants:
+
+  - name: SourceDomain
+    kind: local
+    domain: 0
+    transport: udp
+
+  - name: CmsDiscoveryServer
+    kind: local-discovery-server
+    listening-addresses:
+      - ip: 192.168.50.1
+        port: 11811
